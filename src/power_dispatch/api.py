@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import parse_qs, urlparse
 
-from .errors import SupplyError, ValidationFailed
+from .errors import SupplyError, Unauthenticated, ValidationFailed
 from .service import SupplyService
 from .storage import connect
 
@@ -26,11 +27,14 @@ class JsonApplication:
         self.service = service
 
     @staticmethod
-    def _actor(headers: Mapping[str, str]) -> str:
-        actor = headers.get("x-actor-id", "").strip()
-        if not actor:
-            raise ValidationFailed("缺少 X-Actor-Id")
-        return actor
+    def _bearer(headers: Mapping[str, str]) -> str:
+        authorization = headers.get("authorization", "").strip()
+        if not authorization:
+            raise Unauthenticated("缺少 Authorization 头")
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() != "bearer" or not token.strip():
+            raise Unauthenticated("授权头必须是 Bearer 令牌")
+        return token.strip()
 
     @staticmethod
     def _json(body: bytes) -> dict[str, Any]:
@@ -54,37 +58,57 @@ class JsonApplication:
             if method == "GET" and path == "/health":
                 return Response(200, {"status": "ok"})
             payload = self._json(body) if method in {"POST", "PUT", "PATCH"} else {}
-            actor = self._actor(normalized)
+            if method == "POST" and path == "/auth/login":
+                return Response(200, self.service.login(payload["user_id"], payload["password"]))
+            token = self._bearer(normalized)
+            actor = self.service.authenticate(token)
+            actor_id = actor["user_id"]
+            if method == "POST" and path == "/auth/logout":
+                self.service.logout(token)
+                return Response(200, {"status": "logged_out"})
             if method == "POST" and path == "/users":
-                return Response(201, self.service.create_user(payload["user_id"], payload["display_name"], payload["role"]))
+                return Response(201, self.service.invite_user(
+                    actor_id,
+                    payload["user_id"],
+                    payload["display_name"],
+                    payload["role"],
+                    payload["password"],
+                    normalized.get("idempotency-key", "").strip() or None,
+                ))
+            if method == "POST" and len(parts) == 3 and parts[0] == "users" and parts[2] == "role":
+                return Response(200, self.service.change_role(actor_id, parts[1], payload["role"]))
+            if method == "POST" and len(parts) == 3 and parts[0] == "users" and parts[2] == "deactivate":
+                return Response(200, self.service.deactivate_user(actor_id, parts[1]))
+            if method == "POST" and len(parts) == 3 and parts[0] == "users" and parts[2] == "activate":
+                return Response(200, self.service.activate_user(actor_id, parts[1]))
             if method == "POST" and path == "/quotes":
-                return Response(201, self.service.record_quote(actor, payload))
+                return Response(201, self.service.record_quote(actor_id, payload))
             if method == "GET" and len(parts) == 3 and parts[:2] == ["quotes", "summary"]:
                 return Response(200, self.service.price_summary(parts[2], int(query.get("sessions", ["20"])[0])))
             if method == "POST" and path == "/facilities":
-                return Response(201, self.service.create_facility(actor, payload))
+                return Response(201, self.service.create_facility(actor_id, payload))
             if method == "POST" and path == "/routes":
-                return Response(201, self.service.create_route(actor, payload))
+                return Response(201, self.service.create_route(actor_id, payload))
             if method == "POST" and len(parts) == 3 and parts[0] == "routes" and parts[2] == "outages":
-                return Response(201, self.service.announce_outage(actor, parts[1], payload["starts_at"], payload.get("ends_at"), payload["capacity_percent"], payload["reason"]))
+                return Response(201, self.service.announce_outage(actor_id, parts[1], payload["starts_at"], payload.get("ends_at"), payload["capacity_percent"], payload["reason"]))
             if method == "POST" and path == "/inventory/lots":
-                return Response(201, self.service.add_inventory_lot(actor, payload))
+                return Response(201, self.service.add_inventory_lot(actor_id, payload))
             if method == "GET" and path == "/inventory/summary":
                 return Response(200, self.service.inventory_summary(query.get("facility_id", [""])[0], query.get("product", [""])[0]))
             if method == "POST" and path == "/nominations":
-                return Response(201, self.service.submit_nomination(actor, payload))
+                return Response(201, self.service.submit_nomination(actor_id, payload))
             if method == "POST" and len(parts) == 3 and parts[0] == "routes" and parts[2] == "allocate":
-                return Response(200, self.service.allocate(actor, parts[1], payload["service_date"]))
+                return Response(200, self.service.allocate(actor_id, parts[1], payload["service_date"]))
             if method == "POST" and path == "/transfers":
-                return Response(201, self.service.dispatch_transfer(actor, payload["transfer_id"], payload["nomination_id"], payload["lot_id"], int(payload["expected_revision"])))
+                return Response(201, self.service.dispatch_transfer(actor_id, payload["transfer_id"], payload["nomination_id"], payload["lot_id"], int(payload["expected_revision"])))
             if method == "POST" and path == "/scenarios":
-                return Response(201, self.service.create_scenario(actor, payload))
+                return Response(201, self.service.create_scenario(actor_id, payload))
             if method == "POST" and len(parts) == 3 and parts[0] == "scenarios" and parts[2] == "approve":
-                return Response(200, self.service.approve_scenario(actor, parts[1], int(payload["expected_revision"])))
+                return Response(200, self.service.approve_scenario(actor_id, parts[1], int(payload["expected_revision"])))
             if method == "POST" and len(parts) == 3 and parts[0] == "scenarios" and parts[2] == "run":
-                return Response(200, self.service.run_scenario(actor, parts[1], payload["as_of_date"]))
+                return Response(200, self.service.run_scenario(actor_id, parts[1], payload["as_of_date"]))
             if method == "GET" and path == "/audit/chain":
-                return Response(200, self.service.audit_chain(actor))
+                return Response(200, self.service.audit_chain(actor_id))
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
         except SupplyError as exc:
             return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})
@@ -124,8 +148,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--database", type=Path, default=Path("power_dispatch.sqlite3"))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--bootstrap-admin", help="首次部署时创建管理员编号")
+    parser.add_argument("--bootstrap-password", help="管理员初始口令；也可用 POWER_DISPATCH_ADMIN_PASSWORD 环境变量")
     args = parser.parse_args(argv)
     connection = connect(args.database)
+    if args.bootstrap_admin:
+        password = args.bootstrap_password or os.environ.get("POWER_DISPATCH_ADMIN_PASSWORD", "")
+        if not password:
+            parser.error("引导管理员必须通过 --bootstrap-password 或环境变量提供口令")
+        service = SupplyService(connection)
+        service.bootstrap_admin(args.bootstrap_admin, args.bootstrap_admin, password)
+        print(f"管理员 {args.bootstrap_admin} 已引导完成")
     server = ThreadingHTTPServer((args.host, args.port), make_handler(JsonApplication(SupplyService(connection))))
     try:
         server.serve_forever()

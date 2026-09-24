@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 import sqlite3
 from datetime import timedelta
 from decimal import Decimal
 from typing import Any, Iterable, Mapping
 
 from .clock import SystemClock, parse_utc, utc_text
-from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
+from .errors import Conflict, Forbidden, InvalidState, NotFound, Unauthenticated, ValidationFailed
 from .models import IndexQuote, Facility, InventoryLot, NominationRequest, Route, SupplyScenario
 from .planning import (
     AllocationRequest,
@@ -31,11 +32,23 @@ from .storage import initialize, transaction
 
 
 ROLE_PERMISSIONS = {
+    "admin": {"account.manage", "report.read", "audit.read"},
     "planner": {"quote.write", "catalog.write", "scenario.write", "scenario.run"},
     "dispatcher": {"nomination.write", "allocation.run", "transfer.write", "inventory.write"},
     "risk": {"outage.write", "scenario.approve", "report.read"},
     "auditor": {"report.read", "audit.read"},
 }
+
+SESSION_TOKEN_BYTES = 32
+PBKDF2_ITERATIONS = 200_000
+
+
+def hash_password(password: str, salt: str | None = None) -> tuple[str, str]:
+    salt = salt or secrets.token_hex(16)
+    derived = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), bytes.fromhex(salt), PBKDF2_ITERATIONS
+    ).hex()
+    return salt, derived
 
 
 class SupplyService:
@@ -62,6 +75,185 @@ class SupplyService:
         if permission not in ROLE_PERMISSIONS[user["role"]]:
             raise Forbidden(f"角色 {user['role']} 无权执行 {permission}")
         return user
+
+    def bootstrap_admin(self, user_id: str, display_name: str, password: str) -> dict[str, Any]:
+        """创建首位管理员；系统中已有管理员时拒绝，避免无凭据提权。"""
+        user_id = user_id.strip()
+        display_name = display_name.strip()
+        if not user_id or not display_name:
+            raise ValidationFailed("用户编号和名称不能为空")
+        if not password:
+            raise ValidationFailed("初始口令不能为空")
+        existing = self.connection.execute(
+            "SELECT 1 FROM supply_users WHERE role='admin' LIMIT 1"
+        ).fetchone()
+        if existing is not None:
+            raise Conflict("管理员已经存在，账号开通必须由管理员邀请")
+        salt, derived = hash_password(password)
+        try:
+            with transaction(self.connection, immediate=True):
+                self.connection.execute(
+                    "INSERT INTO supply_users(user_id,display_name,role,password_salt,password_hash,created_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (user_id, display_name, "admin", salt, derived, self._now()),
+                )
+                self._audit("user", user_id, "user.invited", "system",
+                            {"display_name": display_name, "role": "admin", "bootstrap": True})
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("用户已经存在") from exc
+        return {"user_id": user_id, "role": "admin", "active": True}
+
+    def login(self, user_id: str, password: str) -> dict[str, Any]:
+        row = self.connection.execute(
+            "SELECT * FROM supply_users WHERE user_id=?", (user_id.strip(),)
+        ).fetchone()
+        if row is None or row["password_hash"] is None or not row["active"]:
+            raise Unauthenticated("账号或口令不正确")
+        _, derived = hash_password(password, row["password_salt"])
+        if not secrets.compare_digest(derived, row["password_hash"]):
+            raise Unauthenticated("账号或口令不正确")
+        token = secrets.token_urlsafe(SESSION_TOKEN_BYTES)
+        with transaction(self.connection, immediate=True):
+            self.connection.execute(
+                "INSERT INTO supply_sessions(token_sha256,user_id,issued_at) VALUES(?,?,?)",
+                (hashlib.sha256(token.encode("utf-8")).hexdigest(), row["user_id"], self._now()),
+            )
+        return {"token": token, "user_id": row["user_id"], "role": row["role"]}
+
+    def authenticate(self, token: str) -> sqlite3.Row:
+        """凭会话令牌解析当前用户；停用即随会话吊销一并拒绝。"""
+        token = token.strip()
+        if not token:
+            raise Unauthenticated("缺少登录令牌")
+        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        row = self.connection.execute(
+            "SELECT u.* FROM supply_sessions s JOIN supply_users u ON u.user_id=s.user_id "
+            "WHERE s.token_sha256=? AND s.revoked_at IS NULL AND u.active=1",
+            (token_hash,),
+        ).fetchone()
+        if row is None:
+            raise Unauthenticated("会话不存在、已失效或账号已停用")
+        return row
+
+    def logout(self, token: str) -> None:
+        token_hash = hashlib.sha256(token.strip().encode("utf-8")).hexdigest()
+        with transaction(self.connection, immediate=True):
+            self.connection.execute(
+                "UPDATE supply_sessions SET revoked_at=? WHERE token_sha256=? AND revoked_at IS NULL",
+                (self._now(), token_hash),
+            )
+
+    def invite_user(
+        self,
+        actor_id: str,
+        user_id: str,
+        display_name: str,
+        role: str,
+        password: str,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        self._require(actor_id, "account.manage")
+        user_id = user_id.strip()
+        display_name = display_name.strip()
+        if role not in ROLE_PERMISSIONS:
+            raise ValidationFailed("未知角色")
+        if not user_id or not display_name:
+            raise ValidationFailed("用户编号和名称不能为空")
+        if not password:
+            raise ValidationFailed("初始口令不能为空")
+        request_digest = digest(
+            {"user_id": user_id, "display_name": display_name, "role": role}
+        )
+        if idempotency_key:
+            stored = self.connection.execute(
+                "SELECT request_sha256,response_json FROM supply_idempotency "
+                "WHERE scope='user_invite' AND idempotency_key=?",
+                (idempotency_key,),
+            ).fetchone()
+            if stored is not None:
+                if stored["request_sha256"] != request_digest:
+                    raise Conflict("幂等键对应不同账号内容")
+                return json.loads(stored["response_json"])
+        salt, derived = hash_password(password)
+        response = {"user_id": user_id, "role": role, "active": True}
+        try:
+            with transaction(self.connection, immediate=True):
+                legacy = self.connection.execute(
+                    "SELECT role,password_hash FROM supply_users WHERE user_id=?", (user_id,)
+                ).fetchone()
+                if legacy is None:
+                    self.connection.execute(
+                        "INSERT INTO supply_users(user_id,display_name,role,password_salt,password_hash,created_at) "
+                        "VALUES(?,?,?,?,?,?)",
+                        (user_id, display_name, role, salt, derived, self._now()),
+                    )
+                elif legacy["password_hash"] is None:
+                    # 旧版无凭据账号：由管理员补设口令并接管角色
+                    self.connection.execute(
+                        "UPDATE supply_users SET display_name=?,role=?,password_salt=?,password_hash=?,active=1 "
+                        "WHERE user_id=?",
+                        (display_name, role, salt, derived, user_id),
+                    )
+                else:
+                    raise sqlite3.IntegrityError("用户已经存在")
+                if idempotency_key:
+                    self.connection.execute(
+                        "INSERT INTO supply_idempotency(scope,idempotency_key,request_sha256,response_json,created_at) "
+                        "VALUES('user_invite',?,?,?,?)",
+                        (idempotency_key, request_digest, canonical_json(response), self._now()),
+                    )
+                self._audit("user", user_id, "user.invited", actor_id,
+                            {"display_name": display_name, "role": role,
+                             "legacy_claim": legacy is not None})
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("用户已经存在") from exc
+        return response
+
+    def change_role(self, actor_id: str, user_id: str, new_role: str) -> dict[str, Any]:
+        self._require(actor_id, "account.manage")
+        if new_role not in ROLE_PERMISSIONS:
+            raise ValidationFailed("未知角色")
+        if user_id == actor_id:
+            raise Forbidden("不能变更自己的角色")
+        with transaction(self.connection, immediate=True):
+            row = self.connection.execute(
+                "SELECT role,active FROM supply_users WHERE user_id=?", (user_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFound("用户不存在")
+            if not row["active"]:
+                raise InvalidState("账号已停用，请先重新开通")
+            if row["role"] == new_role:
+                raise Conflict("角色未发生变化")
+            self.connection.execute(
+                "UPDATE supply_users SET role=? WHERE user_id=?", (new_role, user_id)
+            )
+            self._audit("user", user_id, "user.role_changed", actor_id,
+                        {"from_role": row["role"], "to_role": new_role})
+        return {"user_id": user_id, "role": new_role, "active": True}
+
+    def deactivate_user(self, actor_id: str, user_id: str) -> dict[str, Any]:
+        self._require(actor_id, "account.manage")
+        if user_id == actor_id:
+            raise Forbidden("不能停用自己的账号")
+        with transaction(self.connection, immediate=True):
+            row = self.connection.execute(
+                "SELECT active,role FROM supply_users WHERE user_id=?", (user_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFound("用户不存在")
+            if not row["active"]:
+                raise Conflict("账号已经停用")
+            cursor = self.connection.execute(
+                "UPDATE supply_sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL",
+                (self._now(), user_id),
+            )
+            self.connection.execute(
+                "UPDATE supply_users SET active=0 WHERE user_id=?", (user_id,)
+            )
+            self._audit("user", user_id, "user.deactivated", actor_id,
+                        {"role": row["role"], "sessions_revoked": cursor.rowcount})
+        return {"user_id": user_id, "active": False, "sessions_revoked": cursor.rowcount}
 
     def _audit(
         self,
@@ -100,20 +292,21 @@ class SupplyService:
             ),
         )
 
-    def create_user(self, user_id: str, display_name: str, role: str) -> dict[str, Any]:
-        if role not in ROLE_PERMISSIONS:
-            raise ValidationFailed("未知角色")
-        if not user_id.strip() or not display_name.strip():
-            raise ValidationFailed("用户编号和名称不能为空")
-        try:
-            with transaction(self.connection, immediate=True):
-                self.connection.execute(
-                    "INSERT INTO supply_users(user_id,display_name,role,created_at) VALUES(?,?,?,?)",
-                    (user_id.strip(), display_name.strip(), role, self._now()),
-                )
-        except sqlite3.IntegrityError as exc:
-            raise Conflict("用户已经存在") from exc
-        return {"user_id": user_id.strip(), "role": role}
+    def activate_user(self, actor_id: str, user_id: str) -> dict[str, Any]:
+        self._require(actor_id, "account.manage")
+        with transaction(self.connection, immediate=True):
+            row = self.connection.execute(
+                "SELECT active,role FROM supply_users WHERE user_id=?", (user_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFound("用户不存在")
+            if row["active"]:
+                raise Conflict("账号已经启用")
+            self.connection.execute(
+                "UPDATE supply_users SET active=1 WHERE user_id=?", (user_id,)
+            )
+            self._audit("user", user_id, "user.reactivated", actor_id, {"role": row["role"]})
+        return {"user_id": user_id, "role": row["role"], "active": True}
 
     def record_quote(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
         self._require(actor_id, "quote.write")

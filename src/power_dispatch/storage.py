@@ -14,10 +14,22 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS supply_users (
     user_id TEXT PRIMARY KEY,
     display_name TEXT NOT NULL,
-    role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor')),
+    role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor','admin')),
     active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+    password_salt TEXT,
+    password_hash TEXT,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS supply_sessions (
+    token_sha256 TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES supply_users(user_id),
+    issued_at TEXT NOT NULL,
+    revoked_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_user
+ON supply_sessions(user_id, revoked_at);
 
 CREATE TABLE IF NOT EXISTS market_index_quotes (
     quote_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -198,7 +210,9 @@ ON supply_audit_events(entity_type, entity_id, event_id);
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10)
+    # ThreadingHTTPServer 会在工作线程中复用连接；WAL、busy_timeout 与
+    # IMMEDIATE 事务保证并发写入安全。
+    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA journal_mode=WAL")
@@ -209,6 +223,45 @@ def connect(path: str | Path) -> sqlite3.Connection:
 
 def initialize(connection: sqlite3.Connection) -> None:
     connection.executescript(SCHEMA)
+    _migrate_users(connection)
+
+
+def _migrate_users(connection: sqlite3.Connection) -> None:
+    """把缺少口令列和 admin 角色约束的旧 supply_users 升级为新结构。"""
+    sql = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='supply_users'"
+    ).fetchone()
+    if sql is not None and "password_salt" in sql["sql"]:
+        return
+    # legacy_alter_table 保证重命名时其他表的外键仍指向 supply_users，
+    # 不会被改写到中转表名。
+    connection.execute("PRAGMA foreign_keys=OFF")
+    connection.execute("PRAGMA legacy_alter_table=ON")
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("ALTER TABLE supply_users RENAME TO supply_users_legacy")
+        connection.execute(
+            "CREATE TABLE supply_users ("
+            "user_id TEXT PRIMARY KEY,"
+            "display_name TEXT NOT NULL,"
+            "role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor','admin')),"
+            "active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),"
+            "password_salt TEXT,"
+            "password_hash TEXT,"
+            "created_at TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO supply_users(user_id,display_name,role,active,created_at) "
+            "SELECT user_id,display_name,role,active,created_at FROM supply_users_legacy"
+        )
+        connection.execute("DROP TABLE supply_users_legacy")
+        connection.execute("COMMIT")
+    except BaseException:
+        connection.execute("ROLLBACK")
+        raise
+    finally:
+        connection.execute("PRAGMA legacy_alter_table=OFF")
+        connection.execute("PRAGMA foreign_keys=ON")
 
 
 @contextmanager

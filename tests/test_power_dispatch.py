@@ -65,8 +65,9 @@ class SupplyServiceTests(unittest.TestCase):
         self.connection.row_factory = sqlite3.Row
         self.clock = FrozenClock(datetime(2026, 9, 24, 8, 0, tzinfo=timezone.utc))
         self.service = SupplyService(self.connection, self.clock)
+        self.service.bootstrap_admin("admin", "调度管理员", "admin-pass")
         for user_id, role in (("plan", "planner"), ("dispatch", "dispatcher"), ("risk", "risk"), ("audit", "auditor")):
-            self.service.create_user(user_id, user_id, role)
+            self.service.invite_user("admin", user_id, user_id, role, f"{user_id}-pass")
         self.service.create_facility("plan", {"facility_id": "field-a", "name": "北部电厂", "kind": "storage", "timezone": "Asia/Shanghai", "capacity_mwh": "500000"})
         self.service.create_facility("plan", {"facility_id": "terminal-b", "name": "沿海终端", "kind": "terminal", "timezone": "Asia/Shanghai", "capacity_mwh": "800000"})
         self.service.create_route("plan", {"route_id": "pipe-a-b", "origin_id": "field-a", "destination_id": "terminal-b", "product": "crude", "daily_capacity": "100000", "loss_basis_points": 25, "transit_hours": 36})
@@ -127,8 +128,11 @@ class SupplyServiceTests(unittest.TestCase):
         app = JsonApplication(self.service)
         self.assertEqual(app.handle("GET", "/health").status, 200)
         response = app.handle("GET", "/quotes/summary/PEAK_VALLEY", {"X-Actor-Id": "plan"})
-        self.assertEqual(response.status, 404)
-        self.assertEqual(response.body["error"]["code"], "not_found")
+        self.assertEqual(response.status, 401)
+        self.assertEqual(response.body["error"]["code"], "unauthenticated")
+        token = self.service.login("plan", "plan-pass")["token"]
+        authed = app.handle("GET", "/quotes/summary/PEAK_VALLEY", {"Authorization": f"Bearer {token}"})
+        self.assertEqual(authed.status, 404)
 
 
 if __name__ == "__main__":

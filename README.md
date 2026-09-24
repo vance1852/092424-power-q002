@@ -61,4 +61,17 @@ PYTHONPATH=src python3 -m plant_science.acceptance --workspace .
 PYTHONPATH=src python3 -m power_dispatch.api --database power_dispatch.sqlite3 --host 127.0.0.1 --port 8080
 ```
 
-健康检查为 `GET /health`。除健康检查外，请求通过 `X-Actor-Id` 携带操作者编号。可用接口覆盖电价、设施、送出线路、停运事件、燃料批次、提名、能力分配、送电、负荷情景和审计链。服务重启后，SQLite 中的业务状态和历史版本会继续保留。
+健康检查为 `GET /health`，无需登录。其他所有接口必须携带登录令牌：先由 `POST /auth/login`（提交 `user_id`/`password`）换取令牌，再在请求头携带 `Authorization: Bearer <token>`；自报的 `X-Actor-Id` 不再生效。
+
+账号开通走受保护的身份流程：
+
+1. 首次部署用 `--bootstrap-admin` 离线引导唯一一位管理员（口令经 `--bootstrap-password` 或 `POWER_DISPATCH_ADMIN_PASSWORD` 提供，PBKDF2 加盐存储）：
+   ```bash
+   PYTHONPATH=src python3 -m power_dispatch.api --database power_dispatch.sqlite3 \
+       --bootstrap-admin root --bootstrap-password '强口令'
+   ```
+2. 只有已启用的 `admin` 角色可以 `POST /users` 邀请账号（须设初始口令），未登录返回 401，非管理员返回 403。邀请支持 `Idempotency-Key` 请求头，重复请求只创建一个账号；同键不同内容返回 409。
+3. `POST /users/{id}/role`、`POST /users/{id}/deactivate`、`POST /users/{id}/activate` 仅限管理员，且不能对自己执行；角色变更、停用、重新启用均写入 SHA-256 哈希链审计（`GET /audit/chain` 可校验）。
+4. 停用时该用户全部未失效会话立即吊销，旧令牌的下一次请求即返回 401；`POST /auth/logout` 可主动注销。
+
+其余接口覆盖电价、设施、送出线路、停运事件、燃料批次、提名、能力分配、送电、负荷情景和审计链，按 planner/dispatcher/risk/auditor 角色权限放行。服务重启后，SQLite 中的业务状态、账号、会话和历史版本会继续保留。
