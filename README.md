@@ -58,7 +58,21 @@ PYTHONPATH=src python3 -m plant_science.acceptance --workspace .
 ## HTTP 服务
 
 ```bash
-PYTHONPATH=src python3 -m power_dispatch.api --database power_dispatch.sqlite3 --host 127.0.0.1 --port 8080
+PYTHONPATH=src python3 -m power_dispatch.api --database power_dispatch.sqlite3 --host 127.0.0.1 --port 8080 \
+  --bootstrap-admin root --bootstrap-secret '更换为强密钥'
 ```
 
-健康检查为 `GET /health`。除健康检查外，请求通过 `X-Actor-Id` 携带操作者编号。可用接口覆盖电价、设施、送出线路、停运事件、燃料批次、提名、能力分配、送电、负荷情景和审计链。服务重启后，SQLite 中的业务状态和历史版本会继续保留。
+健康检查为 `GET /health`，不需要身份。除健康检查外，所有接口都必须持有登录会话令牌：先用编号和初始密钥调用 `POST /login` 换取不透明令牌，再在请求头携带 `Authorization: Bearer <token>`。
+
+## 身份与授权
+
+账号开通纳入受保护的身份流程，不能再匿名自助注册：
+
+- 角色分为 `admin`、`planner`、`dispatcher`、`risk`、`auditor`。`admin` 只持有身份管理权（`identity.manage`），与业务调度权、审计权双向隔离；
+- 空库首次启动时可用 `--bootstrap-admin <编号> --bootstrap-secret <密钥>` 引导首位管理员，之后该引导会自动跳过；
+- 只有已启用的管理员可以 `POST /users` 邀请账号（角色限四种业务角色，不能邀请管理员），请求必须携带 `idempotency_key`，重复提交（含网络重试）返回同一结果且只生成一个账号；同一幂等键对应不同内容返回 `409`；
+- `POST /users/{编号}/role` 变更角色、`POST /users/{编号}/deactivate` 停用账号，二者都会写入哈希串联审计链（`user.role_changed`、`user.deactivated`，含操作者、原角色、原因和撤销会话数）；
+- 停用在同一事务内撤销该用户全部未撤销会话，旧令牌的下一次请求立即返回 `401`，停用账号重新登录返回 `403`；最后一个启用中的管理员不允许停用；
+- 初始密钥使用 PBKDF2-SHA256（20 万轮）加盐哈希存储，会话令牌只在库中保存 SHA-256，`POST /logout` 可主动撤销当前会话。
+
+接口状态码约定：未认证 `401`、已登录但越权 `403`、校验失败 `422`、冲突 `409`。可用接口覆盖电价、设施、送出线路、停运事件、燃料批次、提名、能力分配、送电、负荷情景和审计链；`GET /audit/chain` 仅 `auditor` 可读取，并返回逐事件明细供核验。服务重启后，SQLite 中的业务状态和历史版本会继续保留。

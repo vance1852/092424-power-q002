@@ -66,7 +66,7 @@ class SupplyServiceTests(unittest.TestCase):
         self.clock = FrozenClock(datetime(2026, 9, 24, 8, 0, tzinfo=timezone.utc))
         self.service = SupplyService(self.connection, self.clock)
         for user_id, role in (("plan", "planner"), ("dispatch", "dispatcher"), ("risk", "risk"), ("audit", "auditor")):
-            self.service.create_user(user_id, user_id, role)
+            self.service.create_user(user_id, user_id, role, f"pw-{user_id}")
         self.service.create_facility("plan", {"facility_id": "field-a", "name": "北部电厂", "kind": "storage", "timezone": "Asia/Shanghai", "capacity_mwh": "500000"})
         self.service.create_facility("plan", {"facility_id": "terminal-b", "name": "沿海终端", "kind": "terminal", "timezone": "Asia/Shanghai", "capacity_mwh": "800000"})
         self.service.create_route("plan", {"route_id": "pipe-a-b", "origin_id": "field-a", "destination_id": "terminal-b", "product": "crude", "daily_capacity": "100000", "loss_basis_points": 25, "transit_hours": 36})
@@ -126,7 +126,9 @@ class SupplyServiceTests(unittest.TestCase):
     def test_api_exposes_browser_free_boundary(self) -> None:
         app = JsonApplication(self.service)
         self.assertEqual(app.handle("GET", "/health").status, 200)
-        response = app.handle("GET", "/quotes/summary/PEAK_VALLEY", {"X-Actor-Id": "plan"})
+        token = app.handle("POST", "/login", body=json.dumps({"user_id": "plan", "secret": "pw-plan"}).encode())
+        headers = {"Authorization": f"Bearer {token.body['token']}"}
+        response = app.handle("GET", "/quotes/summary/PEAK_VALLEY", headers)
         self.assertEqual(response.status, 404)
         self.assertEqual(response.body["error"]["code"], "not_found")
 

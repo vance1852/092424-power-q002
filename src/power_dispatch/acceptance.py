@@ -16,8 +16,9 @@ def run(workspace: Path) -> dict[str, object]:
     connection = sqlite3.connect(":memory:", isolation_level=None)
     connection.row_factory = sqlite3.Row
     service = SupplyService(connection, FrozenClock(datetime(2026, 9, 24, 8, 0, tzinfo=timezone.utc)))
-    for user_id, role in (("plan", "planner"), ("dispatch", "dispatcher"), ("risk", "risk"), ("audit", "auditor")):
-        service.create_user(user_id, user_id, role)
+    service.provision_initial_admin("root", "系统管理员", "root-secret")
+    for index, (user_id, role) in enumerate((("plan", "planner"), ("dispatch", "dispatcher"), ("risk", "risk"), ("audit", "auditor")), start=1):
+        service.invite_user("root", user_id, user_id, role, f"pw-{user_id}", f"invite-{index}")
     for index, close in enumerate(("108", "105", "102", "100", "98", "96"), start=18):
         service.record_quote("plan", {"market_index": "PEAK_VALLEY", "trade_date": f"2026-09-{index}", "close_cny": close, "source_revision": f"rev-{index}", "observed_at": f"2026-09-{index}T21:00:00Z"})
     service.create_facility("plan", {"facility_id": "field-a", "name": "北部电厂", "kind": "storage", "timezone": "Asia/Shanghai", "capacity_mwh": "500000"})

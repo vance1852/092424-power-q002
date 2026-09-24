@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import parse_qs, urlparse
 
-from .errors import SupplyError, ValidationFailed
+from .errors import Conflict, SupplyError, Unauthorized, ValidationFailed
 from .service import SupplyService
 from .storage import connect
 
@@ -26,11 +26,14 @@ class JsonApplication:
         self.service = service
 
     @staticmethod
-    def _actor(headers: Mapping[str, str]) -> str:
-        actor = headers.get("x-actor-id", "").strip()
-        if not actor:
-            raise ValidationFailed("缺少 X-Actor-Id")
-        return actor
+    def _token(headers: Mapping[str, str]) -> str:
+        authorization = headers.get("authorization", "").strip()
+        if not authorization:
+            raise Unauthorized("缺少 Authorization 头")
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() != "bearer" or not token.strip():
+            raise Unauthorized("Authorization 头必须是 Bearer 令牌")
+        return token.strip()
 
     @staticmethod
     def _json(body: bytes) -> dict[str, Any]:
@@ -54,9 +57,27 @@ class JsonApplication:
             if method == "GET" and path == "/health":
                 return Response(200, {"status": "ok"})
             payload = self._json(body) if method in {"POST", "PUT", "PATCH"} else {}
-            actor = self._actor(normalized)
+            # 登录是唯一的匿名入口，其余接口都必须持有有效会话令牌。
+            if method == "POST" and path == "/login":
+                return Response(200, self.service.login(payload["user_id"], payload["secret"]))
+            user = self.service.authenticate_token(self._token(normalized))
+            actor = user["user_id"]
+            if method == "POST" and path == "/logout":
+                self.service.logout(self._token(normalized))
+                return Response(200, {"status": "logged_out"})
             if method == "POST" and path == "/users":
-                return Response(201, self.service.create_user(payload["user_id"], payload["display_name"], payload["role"]))
+                return Response(201, self.service.invite_user(
+                    actor,
+                    payload["user_id"],
+                    payload["display_name"],
+                    payload["role"],
+                    payload["secret"],
+                    payload.get("idempotency_key", ""),
+                ))
+            if method == "POST" and len(parts) == 3 and parts[0] == "users" and parts[2] == "role":
+                return Response(200, self.service.change_user_role(actor, parts[1], payload["role"]))
+            if method == "POST" and len(parts) == 3 and parts[0] == "users" and parts[2] == "deactivate":
+                return Response(200, self.service.deactivate_user(actor, parts[1], payload.get("reason", "")))
             if method == "POST" and path == "/quotes":
                 return Response(201, self.service.record_quote(actor, payload))
             if method == "GET" and len(parts) == 3 and parts[:2] == ["quotes", "summary"]:
@@ -124,9 +145,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--database", type=Path, default=Path("power_dispatch.sqlite3"))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--bootstrap-admin", default="", help="库中尚无管理员时创建的首位管理员编号")
+    parser.add_argument("--bootstrap-secret", default="", help="首位管理员的初始登录密钥")
     args = parser.parse_args(argv)
     connection = connect(args.database)
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(JsonApplication(SupplyService(connection))))
+    service = SupplyService(connection)
+    if args.bootstrap_admin:
+        try:
+            service.provision_initial_admin(args.bootstrap_admin, args.bootstrap_admin, args.bootstrap_secret)
+        except Conflict:
+            pass  # 管理员已存在，后续账号开通一律走邀请流程
+        except SupplyError as exc:
+            parser.exit(1, f"首位管理员引导失败：{exc}\n")
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(JsonApplication(service)))
     try:
         server.serve_forever()
     except KeyboardInterrupt:

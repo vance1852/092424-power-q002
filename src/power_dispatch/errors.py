@@ -16,6 +16,11 @@ class Conflict(SupplyError):
     status = 409
 
 
+class Unauthorized(SupplyError):
+    code = "unauthorized"
+    status = 401
+
+
 class Forbidden(SupplyError):
     code = "forbidden"
     status = 403

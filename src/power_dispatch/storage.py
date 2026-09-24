@@ -14,9 +14,30 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS supply_users (
     user_id TEXT PRIMARY KEY,
     display_name TEXT NOT NULL,
-    role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor')),
+    role TEXT NOT NULL CHECK(role IN ('admin','planner','dispatcher','risk','auditor')),
     active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+    credential_secret TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS supply_sessions (
+    token_hash TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL,
+    last_used_at TEXT NOT NULL,
+    revoked_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_supply_sessions_user
+ON supply_sessions(user_id);
+
+CREATE TABLE IF NOT EXISTS supply_identity_idempotency (
+    scope TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    request_sha256 TEXT NOT NULL,
+    response_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(scope, idempotency_key)
 );
 
 CREATE TABLE IF NOT EXISTS market_index_quotes (
@@ -198,7 +219,9 @@ ON supply_audit_events(entity_type, entity_id, event_id);
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10)
+    # ThreadingHTTPServer 会在工作线程中复用同一连接；WAL、busy_timeout 与
+    # 显式 IMMEDIATE 事务共同保证并发安全，因此放开同线程限制。
+    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA journal_mode=WAL")
